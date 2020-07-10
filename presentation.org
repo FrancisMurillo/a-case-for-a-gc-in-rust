@@ -1,0 +1,927 @@
+#+Title: A Case For A GC In Rust
+#+Author: Francis Murillo
+#+Email: francis.murillo@protonmail.com
+#+Date: Jul. 27, 2020
+
+#+OPTIONS: num:nil ^:nil
+
+#+OPTIONS: reveal_width:1500 reveal_height:800
+#+OPTIONS: toc:nil
+
+#+OPTIONS: reveal_title_slide:nil
+#+OPTIONS: reveal_single_file:t
+
+#+REVEAL_HLEVEL:1
+#+REVEAL_INIT_OPTIONS: history:true, center:false, hashOneBasedIndex: true, fragmentInURL: true, progress: false, controls: false, center: true
+
+
+#+REVEAL_THEME: solarized
+#+REVEAL_TRANS: linear
+#+REVEAL_SPEED: fast
+
+#+REVEAL_HEAD_PREAMBLE: <meta name="description" content="A Case For A GC In Rust">
+#+REVEAL_EXTRA_CSS: css/presentation.css
+
+#+REVEAL_PLUGINS: (notes highlight)
+
+
+* GC In Rust
+
+  _A Case Study_
+
+
+
+
+  [[http://francismurillo.github.io/][FrancisMurillo]]
+
+
+  GitHub: [[https://github.com/FrancisMurillo/lbry_comment_notifier_rust/][FrancisMurillo]]
+
+
+  Presentation:  [[https://github.com/FrancisMurillo/a-case-for-a-gc-in-rust][FrancisMurillo/a-case-for-a-gc-in-rust]]
+
+
+  Repo: [[https://github.com/FrancisMurillo/silly-queues][FrancisMurillo/silly-queues]]
+
+  #+begin_notes
+  Hi, I am Francis Murillo. Currently Elixir Developer at Digix Global
+  but right now a Rust beginner. Slides and repos are available online
+  after this talk.
+  #+end_notes
+
+* A GC In Rust?
+
+  #+begin_notes
+  A Garbage Collector In Rust. It sounds like an contradiction to Rust's
+  core philosophy or feature. I want to show Rust might need help
+  sometimes...
+  #+end_notes
+
+  #+begin_quote
+  Rust is blazingly fast and memory-efficient: _**with no runtime or
+  garbage collector**_, ...
+
+  https://www.rust-lang.org/
+  #+end_quote
+
+* Concurrent Queue
+
+  #+begin_notes
+  For this talk, let us try to build a concurrent queue. Here is a
+  simple `Queue` trait that requires a push and pop method respective to
+  inserting an element into the tail and taking from the head. Notice
+  that the trait does not require mutable references so you can plug it
+  in thread-safe `Rc`.
+  #+end_notes
+
+  #+begin_src rust
+    pub trait Queue<T> {
+        fn push(&self, item: T);
+
+        fn pop(&self) -> Option<T>;
+    }
+
+    let queue = MyConcurrentQueue { .. };
+    let queue_rc = Arc::new(queue);
+  #+end_src
+
+  [[https://doc.rust-lang.org/book/ch16-00-concurrency.html][Rust Book ch16: Fearless Concurrency]]
+
+* Mutex + VecDeque
+
+  #+begin_notes
+  If you thought the obvious solution was to wrap a Rust queue in a
+  `Mutex`, that the right idea. Thankfully, Rust provides a builtin
+  queue via `VecDeque` which we can combine to create a quick concurrent
+  queue. In this snippet...
+
+  1. I define a `LockingQueue' struct which holds the mutex wrapped
+      queue.
+  2. Mark the queue thread-safe via `Sync` marker trait
+  3. Create a default constructor
+  4. Implement the push trait...
+  5. ... and the pop trait
+
+  Nothing fancy here and we got ourselves a concurrent queue.
+  #+end_notes
+
+  #+ATTR_REVEAL: :code_attribs data-line-numbers='|1|3|5-9|11,12-16|18-22|'
+  #+begin_src rust
+    struct LockingQueue<T>(Mutex<VecDeque<T>>);
+c
+    unsafe impl<T> Sync for LockingQueue<T> {}
+
+    impl<T> LockingQueue<T> {
+        pub fn new() -> Self {
+            Self(Mutex::new(VecDeque::new()))
+        }
+    }
+
+    impl<T> Queue<T> for LockingQueue<T> {
+        fn push(&self, value: T) {
+            let mut queue = self.0.lock().unwrap();
+
+            return queue.push_back(value);
+        }
+
+        fn pop(&self) -> Option<T> {
+            let mut queue = self.0.lock().unwrap();
+
+            return queue.pop_front();
+        }
+    }
+   #+end_src
+
+* No Locks?
+
+  #+begin_notes
+  However, wrapping the whole queue behind a lock may not be the most
+  efficient as other threads are blocked while waiting for the lock to
+  be released. Can we do better by implementing a queue without locks?
+  #+end_notes
+
+  Can we get a lock-free queue?
+
+  #+REVEAL_HTML: <img src="images/423.jpg" class="stretch" >
+
+* Michael-Scott Queue
+
+  #+begin_notes
+  The easiest lock-free queue to implement is the Michael-Scott queue.
+  Essentially, it is a linked list with an empty/sentinel node so that
+  head and tail is never null. To make it concurrent though, it requires
+  a compare-and-swap support.
+  #+end_notes
+
+  #+REVEAL_HTML: <img src="diagrams/queue.png" class="stretch" >
+
+* Compare-And-Swap
+
+  #+begin_notes
+  Fundamentally, compare-and-swap is a synchronization tactic to safely
+  change a variable in a multi-threaded environment. The idea is that
+  before changing a variable, you get a reference beforehand; then if
+  the old reference is the same, then you change it.
+
+  Its pretty simple in principle, but is complicated since the CPU may
+  in between the comparison and assignment statements pause the current
+  thread and possibly wakes another thread that changes the value
+  causing a data race. We need something with stronger guarantees.
+  #+end_notes
+
+  #+begin_src rust
+    let x = 1;
+
+    {
+        let new_x = 2;
+
+        if x == 1 {
+            x = new_x;
+        }
+    }
+  #+end_src
+
+  [[https://doc.rust-lang.org/nomicon/atomics.html][Rustonomicon: Atomics]]
+
+** AtomicPtr
+
+   #+begin_notes
+   Rust provides concurrent primitives from the `atomic` module such as
+   `AtomicBool`, `AtomicUsize` and in particular `AtomicPtr` which is an
+   thread-safe pointer. What we need specifically is the
+   `compare_and_swap` method which works at a hardware or CPU level and
+   guarantees the level of thread-safety we needed. For example in this
+   snippet where I change the next pointer of a node,
+
+   1. Make a node with a null next pointer
+   2. Prepare the new next node
+   3. Create the next node and get a pointer to it.
+   4. Load the pointer to it via `.load` method which takes an atomic
+      ordering.
+   5. Use `compare_and_swap` method which takes the old pointer, the new
+      pointer and an atomic ordering. If it returns the old pointer, the
+      swap succeeded.
+   6. If it fails when another thread beats us to the operation, we just
+      keep trying until it succeeds.
+
+   Quite some complexity just to change a variable but this is the core
+   strategy of the queue.
+   #+end_notes
+
+   #+ATTR_REVEAL: :code_attribs data-line-numbers='|1,3,5|7-8|11|13-16|7-17|'
+   #+begin_src rust
+     use std::sync::atomic::{AtomicPtr, Ordering::SeqCst};
+
+     struct Node { value: usize, next: AtomicPtr<Node> };
+
+     let node = Node { value: 0, next: AtomicPtr::default() };
+
+     let next_node = Node { value: 1, next: AtomicPtr::default() };
+     let new_ptr: *mut Node = &mut next_node;
+
+     loop {
+         let old_ptr: *mut Node = node.next.load(SeqCst);
+
+         if node.next.compare_and_swap(old_ptr, new_ptr, SeqCst)
+             == old_ptr {
+                 break;
+             }
+     }
+   #+end_src
+
+   [[https://doc.rust-lang.org/std/sync/atomic/struct.AtomicPtr.html][std::sync::atomic::AtomicPtr]]
+
+** Atomic Ordering
+
+   #+begin_notes
+   I have mentioned atomic ordering a few times and I would not be able
+   explain it properly. My intuition is that they are instructions to
+   the CPU how it can access data shared among many threads and provide
+   certain data guarantees. Here are the different levels of atomic
+   ordering starting from the fastest and ending with the safest. This
+   talk is not about atomics but I just want you to know that it exists
+   and I defaulted to use `SeqCst` ordering since it is the safest when
+   in doubt.
+   #+end_notes
+
+   - Relaxed - Fastest
+   - Acquire
+   - Release
+   - AcqRel
+   - _**SeqCst**_ - Safest
+
+   [[https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html][std::sync::atomic::Ordering]]
+
+* Lockless Queue
+
+  #+begin_notes
+  Now we can implement the Michael-Scott queue. I followed the guide in
+  the link and converted it into Rust. I suggest checking it out for a
+  better explanation.
+
+  I will be go through the code relatively fast, so do not worry too
+  much. I just want you to see a different way Rust is used.
+  #+end_notes
+
+  #+REVEAL_HTML: <img src="images/guide.png" class="stretch">
+
+  [[https://www.cs.rochester.edu/research/synchronization/pseudocode/queues.html][Non-Blocking Concurrent Queue Algorithm]]
+
+** Definition
+
+   #+begin_notes
+   Let us begin by defining a new `LocklessQueue` which seems
+   reasonable. Hopefully.
+   #+end_notes
+
+   #+begin_src rust
+     struct Node<T> {
+         value: Option<T>
+         next: AtomicPtr<Node<T>>,
+     }
+
+     struct LocklessQueue<T> {
+         head: AtomicPtr<Node<T>>,
+         tail: AtomicPtr<Node<T>>,
+     }
+
+     unsafe impl<T> Sync for LocklessQueue<T> {}
+   #+end_src
+
+** New
+
+   #+begin_notes
+   This queue needs an empty node where the head and tail will point to
+   initially. In this snippet...
+
+   1. I creating a default empty node.
+   2. Move the `empty_node` to `Box::new` so it not dropped by the end
+      of the function and get a mutable pointer via `Box::into_raw`
+   3. Since pointers are `Copy` type, I can pass them both through head
+      and tail.
+
+   Next up is inserting elements to this queue.
+   #+end_notes
+
+   #+ATTR_REVEAL: :code_attribs data-line-numbers='|3-6|8-9|11-14|'
+   #+begin_src rust
+     impl<T> LocklessQueue<T> {
+         pub fn new() -> Self {
+             let mut empty_node = Node {
+                 value: None,
+                 next: AtomicPtr::default(),
+             };
+
+             let empty_ptr: *mut Node<T> =
+                    Box::into_raw(Box::new(empty_node));
+
+             Self {
+                 head: AtomicPtr::new(empty_ptr),
+                 tail: AtomicPtr::new(empty_ptr),
+             }
+         }
+     }
+   #+end_src
+
+* Push
+
+  #+begin_notes
+  Implementing the push method is pretty similar to other linked lists.
+  The idea is to let the tail next pointer point to the new created node
+  and let that be the new tail.
+  #+end_notes
+
+  #+REVEAL_HTML: <img src="diagrams/push.png" class="stretch">
+
+** .push
+
+   #+begin_notes
+   This is a big function, so I tidied it up a bit and will just cover
+   the happy path but I displayed the whole function so you can see the
+   number of branches required. In this snippet...
+
+   1. Create the new node before starting compare-and-swap loop and get
+      the heap allocated pointer for the new value and node with the box
+      trick to avoid being dropped prematurely.
+   2. Load the tail pointer and the next pointer
+   3. Check if tail pointer is still the same meaning no other thread is interfering
+   4. Then check if the next pointer is null meaning it is still the
+      tail node
+   5. Try to swap the tail's next pointer with the new node
+   6. If that works, try to swap the tail pointer to this new node
+   7. Whether that works or not, we done the job.
+   8. If any of the checks failed, we keep trying until it works
+
+   We now move on to the harder of the two methods: pop.
+   #+end_notes
+
+   #+ATTR_REVEAL: :code_attribs data-line-numbers='|2-6|9-10|12|13|14-18|19-20|22|8-22|'
+   #+begin_src rust
+     fn push(&self, value: T) {
+         let node = Node {
+             value: Some(value),
+             next: AtomicPtr::default(),
+         };
+         let node_ptr = Box::into_raw(Box::new(node));
+
+         loop {
+             let tail_ptr = self.tail.load(SeqCst);
+             let next_ptr = (*tail_ptr).next.load(SeqCst);
+
+             if tail_ptr == self.tail.load(SeqCst) {
+                 if next_ptr.is_null() {
+                     if (*tail_ptr)
+                         .next
+                         .compare_and_swap(next_ptr, node_ptr, SeqCst)
+                         == next_ptr
+                     {
+                         self.tail
+                             .compare_and_swap(tail_ptr, node_ptr, SeqCst);
+
+                         return;
+                     }
+                 } else {
+                     self.tail
+                         .compare_and_swap(tail_ptr, next_ptr, SeqCst);
+                 }
+             }
+         }
+     }
+
+   #+end_src
+
+* Pop
+
+  #+begin_notes
+  Implementing the pop method is slightly different. Instead of simply
+  taking the head's next node and relinking, the idea is to swap the
+  head with its next node and takes its value to become the new head.
+  #+end_notes
+
+  #+REVEAL_HTML: <img src="diagrams/pop.png" class="stretch">
+
+** .pop
+
+   #+begin_notes
+   Even a bigger function that I will tackle only the happy path. In
+   this snippet...
+
+   1. Load the head and next pointer in preparation for the swap.
+   2. Also load the tail pointer to check if the queue is empty
+   3. Same tactic, if the head pointer is still the same or unchanged
+   4. To check if the queue is empty, the head and tail pointer should
+      be the same otherwise we return None
+   5. Assuming we have something to remove, we load the value of the
+      next node before starting the swaps
+   6. Try to swap the head pointer to the next node
+   7. If that succeeds, we want to take the nodes value...
+   8. ... and cleanup the previous node and current node
+   9. Finally returning the value
+   10. If any of the long steps fails, we keep trying.
+
+   We both push and pop implemented we can now call our queue ready.
+   #+end_notes
+
+   #+ATTR_REVEAL: :code_attribs data-line-numbers='|3-4|5|7|8,10|16|18-21|23|25|27|2-5'
+   #+begin_src rust
+     fn pop(&self) -> Option<T> {
+         loop {
+             let head_ptr = self.head.load(SeqCst);
+             let next_ptr = (*head_ptr).next.load(SeqCst);
+             let tail_ptr = self.tail.load(SeqCst);
+
+             if head_ptr == self.head.load(SeqCst) {
+                 if head_ptr == tail_ptr {
+                     if next_ptr.is_null() {
+                         return None;
+                     }
+
+                     self.tail
+                         .compare_and_swap(tail_ptr, next_ptr, SeqCst);
+                 } else {
+                     let next = unsafe { &mut *next_ptr };
+
+                     if self
+                         .head
+                         .compare_and_swap(head_ptr, next_ptr, SeqCst)
+                         == head_ptr
+                     {
+                         let opt = next.value.take();
+
+                         drop(Box::from_raw(head_ptr));
+
+                         return opt;
+                     }
+                 }
+             }
+         }
+     }
+   #+end_src
+
+* Memory Check
+
+  #+begin_notes
+  To check if the queue has no memory leaks, I created a small binary so
+  I can run it under a memory check tool. In this binary, I create a
+  queue where I push some elements and pop elements until it is empty. I
+  also create a tuple struct with debugging drop so I can check if the
+  whole queue is dropped.
+  #+end_notes
+
+  #+begin_src rust
+    struct Value(usize);
+
+    impl Drop for Value {
+        fn drop(&mut self) {
+            println!("DROP-{}", self.0);
+        }
+    }
+
+    fn main() {
+        let queue = LocklessQueue::new();
+
+        for i in 1..5 {
+            queue.push(Value(i));
+        }
+
+        while let Some(item) = queue.pop() {
+            println!("{}", item.0);
+        }
+    }
+  #+end_src
+
+** valgrind
+
+   #+begin_notes
+   If you are using Rust, `valgrind` is a good tool to check if Rust
+   programs leaks memory since we are using so much unsafe. Using it on
+   the binary above leads to positive results of being clean.
+   #+end_notes
+
+   #+begin_src sh
+     $ valgrind --tool=memcheck  ./target/debug/lockless_demo
+
+     ==19213== Memcheck, a memory error detector
+     1
+     DROP-1
+     2
+     DROP-2
+     3
+     DROP-3
+     4
+     DROP-4
+     ==19213== HEAP SUMMARY:
+     ==19213==     in use at exit: 0 bytes in 0 blocks
+     ==19213==   total heap usage: 27 allocs, 27 frees, 3,425 bytes allocated
+     ==19213== All heap blocks were freed -- no leaks are possible
+   #+end_src
+
+* Concurrency Check
+
+  #+begin_notes
+  But does it hold up under concurrent stress? In this new binary, I
+  created four threads that will continuously push and pop 100_000 times
+  and hopefully it will not crash.
+  #+end_notes
+
+  #+begin_src rust
+    fn main() {
+        let queue = LocklessQueue::new();
+        let queue_rc = Arc::new(queue);
+
+        for _ in 1..=4 {
+            let queue_rc = queue_rc.clone();
+
+            thread::spawn(move || {
+                let mut ops = 100_000;
+                let mut i = 0;
+
+                while ops > 1 {
+                    queue_rc.push(ops);
+                    queue_rc.pop();
+                    ops -= 1;
+                }
+            });
+        }
+    }
+  #+end_src
+
+** valgrind
+
+   #+begin_notes
+   Running `valgrind` once more shows that our queue is not so
+   concurrent with an invalid memory access. So what happened?
+   #+end_notes
+
+   #+begin_src sh
+     $ valgrind --tool=memcheck  ./target/debug/lockless_aba_demo
+
+     ==23225== Memcheck, a memory error detector
+
+     ==23225== Thread 5:
+     ==23225== Invalid read of size 8
+     ==23225==    at 0x116F9E: core::sync::atomic::atomic_compare_exchange (atomic.rs:2334)
+     ==23225==    by 0x11590B: core::sync::atomic::AtomicPtr<T>::compare_exchange (atomic.rs:1092)
+     ==23225==    by 0x11585A: core::sync::atomic::AtomicPtr<T>::compare_and_swap (atomic.rs:1042)
+     ==23225==    by 0x11428B: <common::lockless_queue::LocklessQueue<T> as common::queue::Queue<T>>::push (lockless_queue.rs:92)
+     ==23225==    by 0x10F7C9: lockless_aba_demo::main::{{closure}} (lockless_aba_demo.rs:30)
+     ==23225==    by 0x114A69: std::sys_common::backtrace::__rust_begin_short_backtrace (backtrace.rs:130)
+     ==23225==    by 0x111E79: std::thread::Builder::spawn_unchecked::{{closure}}::{{closure}} (mod.rs:475)
+     ==23225==    by 0x115C2D: <std::panic::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once (panic.rs:318)
+     ==23225==    by 0x10DF3B: std::panicking::try::do_call (panicking.rs:331)
+   #+end_src
+
+* ABA Problem
+
+  #+begin_notes
+  What I demonstrated is the notorious ABA problem for compare-and-swap
+  strategies. In our case, it is about improperly dropping a node while
+  another thread is using it. Looking back at the pop method, if one
+  thread is about to drop the head node but another thread is about to
+  use it, this causes an memory error. So what can we do about it?
+  #+end_notes
+
+  #+begin_src rust
+    fn pop(&self) -> Option<T> {
+        let head_ptr = self.head.load(Ordering::Acquire);
+        /// Thread 2 here
+        let next_ptr = (*head_ptr).next.load(Ordering::Relaxed);
+
+        /// Thread 1 here
+        drop(Box::from_raw(head_ptr));
+    }
+  #+end_src
+
+  [[https://bzim.gitlab.io/blog/posts/incinerator-the-aba-problem-and-concurrent-reclamation.html][The ABA Problem and Concurrent Reclamation]]
+
+* Memory Management
+
+  #+begin_notes
+  The Michael-Scott queue stipulates this requirement of not actually
+  dropping nodes but reusing them or having a form of garbage
+  collection. Indeed, implementing the same queue in garbage collected
+  languages do not have this problem. I guess my point for all this
+  effort is to show that using vanilla Rust is not enough in this case.
+  Biting the bullet, what are the options for garbage collection in
+  Rust?
+  #+end_notes
+
+  #+begin_quote
+  It depends for **memory management** on a type-preserving allocator
+  that never reuses a queue node as a different type of object, and
+  _**never returns memory**_ to the operating system.
+  #+end_quote
+
+* Epoch-Based
+
+  #+begin_notes
+  I checked the Rust ecosystem for various memory management libraries
+  and schemes and the `crossbeam` library is the only one that provides
+  a documented epoch-based garbage collector.
+  #+end_notes
+
+  #+begin_src toml
+    [dependencies]
+    crossbeam-epoch = { version = "= 0.8.2" }
+  #+end_src
+
+  [[https://docs.rs/crossbeam-epoch/0.8.2/crossbeam_epoch/struct.Atomic.html][crossbeam_epoch]]
+
+** Garbage List
+
+   #+begin_notes
+   Explaining how epoch-based reclamation exactly works is unclear to
+   me. My intuition is that deleted objects go into a to-delete list and
+   during each garbage cleanup cycle, that object's counter is
+   incremented. When it reaches a certain number, it is completely
+   deleted. Two questions, how is counter incremented and how are
+   objects managed.
+   #+end_notes
+
+   #+begin_src rust
+     /// WARNING: Not actual code
+     struct Handle { ptr: usize }
+     struct Garbage { ptr: usize, counter: usize}
+
+     lazy_static! {
+         static GARBAGE: Vec<Garbage> = Vec::new()
+         static HANDLES: Vec<Handle> = Vec::new()
+     }
+
+     impl Drop for Garbage {
+         fn drop(&mut self) {
+             if self.counter >= 3 { drop(self.ptr) }
+         }
+     }
+   #+end_src
+
+   [[https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf][Epoch-Based Reclamation]]
+
+** Managed
+
+   #+begin_notes
+   To turn a Rust owned type to a managed epoch type, you can just wrap
+   it in a `Owned` or thread-safe `Atomic` type. Pretty natural.
+   #+end_notes
+
+   #+begin_src rust
+     use crossbeam_epoch::{Owned, Atomic};;
+
+     let me_owned = Owned::new("ME");
+     let me_atomic = Atomic::new("ME");
+   #+end_src
+
+** Pinning
+
+   #+begin_notes
+   Whenever you access managed data, you need a thread-local guard that
+   pins or protects accessed variables from being dropped while active.
+   When the guard is dropped or unpinned, the object counters are
+   possibly incremented and garbage collection is executed by that
+   thread. I confess I could be wrong here as even the documentation
+   doesn't explain its mechanics opting to treat it like a black box.
+   #+end_notes
+
+   #+begin_src rust
+     use crossbeam_epoch::{self as epoch, Owned};
+
+     let me_owned = Owned::new("ME");
+
+     {
+         let guard = epoch::pin();
+
+         let me_shared = me_owned.into_shared(&guard);
+
+         drop(guard);
+     }
+   #+end_src
+
+   [[https://docs.rs/crate/crossbeam-epoch/0.8.2/source/src/internal.rs][crossbeam_epoch#internal.rs]]
+
+** Usage
+
+   #+begin_notes
+   What we need is just how to do compare-and-swap with this library. In
+   this snippet where I want to change an account balance...
+
+   1. I define an account struct with an thread-safe managed pointer via
+      `Atomic`
+   2. Create a new account with an initial balance
+   3. As before, I create a new balance via `Owned`
+   4. Get a thread guard via `epoch::pin`
+   5. Get a managed reference via `.load` similar to `AtomicPtr` but
+      also takes a `guard` reference
+   6. Finally, do a similar `compare-and-swap` but with an extra `guard`
+      reference. I like that it returns an `Result` for better
+      ergonomics.
+
+   Indeed, it functions like `AtomicPtr` but better where you have less
+   unsafe to deal with and corresponds with Rust ownership types.
+   #+end_notes
+
+   #+ATTR_REVEAL: :code_attribs data-line-numbers='|1,3|5|7|9|10|12-19|'
+   #+begin_src rust
+     use crossbeam_epoch::{self as epoch, Atomic, Owned, Shared};
+
+     struct Account { balance: Atomic::<usize> };
+
+     let debit = Account { balance: Atomic::new(10_000) };
+
+     let new_balance: Owned<usize> = Owned::new(7_777);
+
+     let guard = epoch::pin();
+     let old_balance: Shared<usize> = debit.balance.load(SeqCst, &guard);
+
+     debit.balance
+         .compare_and_set(
+             old_balance,
+             new_balance.into_shared(&guard),
+             SeqCst,
+             &guard
+         )
+         .ok()
+   #+end_src
+
+* GcQueue
+
+  #+begin_notes
+  Integrating this memory management library back to our `LocklessQueue`
+  yields roughly the same code and with better ergonomics. Since its
+  mostly the same, I will just highlight how it solves the drop issue.
+  #+end_notes
+
+  #+begin_src rust
+    use crossbeam_epoch::{Atomic};
+
+    struct Node<T> {
+        value: Option<T>,
+        next: Atomic<Node<T>>,
+    }
+
+    struct GcQueue<T> {
+        head: Atomic<Node<T>>,
+        tail: Atomic<Node<T>>,
+    }
+  #+end_src
+
+** Drop Fix
+
+   #+begin_notes
+   Going back to to pop...
+
+   1. Since this whole queue is now automatically managed, instead of
+      immediately deleting the old head with `drop`, I instruct the
+      guard to delete it when no other thread is accessing it.
+   2. The impact of this is that when the next pointer is loaded from
+      another thread, it is not dropped and will fail the reference
+      check.
+   3. Until both threads drop their `guard`, the old head is safe to
+      access.
+
+   This fixes the problem and we now have a concurrent queue.
+   #+end_notes
+
+   #+ATTR_REVEAL: :code_attribs data-line-numbers='|27|5,7-9,11|2|'
+   #+begin_src rust
+     fn pop(&self) -> Option<T> {
+         let guard = epoch::pin();
+
+         loop {
+             let mut head_shared = self.head.load(SeqCst, &guard);
+             let tail_shared = self.tail.load(SeqCst, &guard);
+             let mut next_shared = unsafe { head_shared.deref_mut() }
+                 .next
+                 .load(SeqCst, &guard);
+
+             if head_shared == self.head.load(SeqCst, &guard) {
+                 if head_shared == tail_shared {
+                     if next_shared.is_null() {
+                         return None;
+                     }
+
+                     self.tail
+                         .compare_and_set(tail_shared, next_shared, SeqCst, &guard)
+                         .ok();
+                 } else {
+                     if self
+                         .head
+                         .compare_and_set(head_shared, next_shared, SeqCst, &guard)
+                         .is_ok()
+                     {
+                         unsafe {
+                             guard.defer_destroy(head_shared);
+
+                             return next_shared.deref_mut().value.take();
+                         }
+                     }
+
+                     continue;
+                 }
+             }
+         }
+     }
+   #+end_src
+
+** Concurrency Test
+
+   #+begin_notes
+   Applying the same test with the newly integrated queue, it does not
+   crash but it does have some apparently leaked memory. It is a known
+   issue with `valgrind` that it reports false positives by
+   `crossbeam_epoch` even if you cleanup properly. Oh well but it works.
+   #+end_notes
+
+   #+begin_src sh
+     $ valgrind --tool=memcheck  ./target/debug/gc_aba_demo
+
+     ==33608== Memcheck, a memory error detector
+     ==33608==
+     ==33608== HEAP SUMMARY:
+     ==33608==     in use at exit: 1,899,648 bytes in 6,890 blocks
+     ==33608==   total heap usage: 203,241 allocs, 196,351 frees, 9,796,808 bytes allocated
+     ==33608==
+     ==33608== LEAK SUMMARY:
+     ==33608==    definitely lost: 0 bytes in 0 blocks
+     ==33608==    indirectly lost: 0 bytes in 0 blocks
+     ==33608==      possibly lost: 0 bytes in 0 blocks
+     ==33608==    still reachable: 1,899,648 bytes in 6,890 blocks
+     ==33608==         suppressed: 0 bytes in 0 blocks
+     ==33608== Rerun with --leak-check=full to see details of leaked memory
+   #+end_src
+
+   [[https://github.com/tokio-rs/tokio/issues/872#issuecomment-458239588][tokio-rs/issue/872]]
+
+* Benchmark
+
+  #+begin_notes
+  To put our theories to the test, we need to benchmark our concurrent
+  queues. For our benchmarking tool, I choose `criterion` over the
+  default `cargo bench` as it is more flexible and overall has better
+  reporting. Its fairly easy to setup, use and its generally worth
+  checking out.
+  #+end_notes
+
+  #+begin_src toml
+    [[bench]]
+    name = "queue_benchmark"
+    harness = false
+
+    [dev-dependencies]
+    criterion = { version = "= 0.3.3" }
+  #+end_src
+
+  [[https://bheisler.github.io/criterion.rs/book/getting_started.html][criterion.rs: Getting Started]]
+
+** Report
+
+   #+begin_notes
+   So setting up and running `criterion` with `cargo bench` gives us
+   this nice HTML report. This graph represents a how long on average a
+   concurrent queue executes 1_000_000 combined push and pop operations
+   spread over a variable number of threads or the x-axis. Taking a
+   closer look:
+
+   1. The yellow line is the `Mutex` + `VecDeque` queue and is expected
+      to perform the worst.
+   2. However, I added a queue where the head and tail are locked
+      separately that is the red line and is expected to perform better
+      but is worse than locking the whole collection. This tells us
+      allocations cost also matter
+   3. Despite that, the blue line is the garbage collected queue and
+      performs better which is a win.
+   4. To set expectations, I added `crossbeam`'s queue that is the red
+      line and does impressively better. No need to reinvent the wheel
+      but still fun to try.
+   #+end_notes
+
+   #+REVEAL_HTML: <img src="images/benchmark.svg" class="stretch" style="background: white;" >
+
+* Zero Cost Abstractions
+
+  #+begin_notes
+  All this to say that Rust can have a garbage collector and still feel
+  like Rust. Garbage collector/memory management as a library or
+  tradeoff, I think that is still in the spirit of Rust and not a
+  contradiction.
+  #+end_notes
+
+  #+begin_quote
+  What you don’t use, you don’t pay for. And further: What you do use,
+  you couldn’t hand code any better.
+  #+end_quote
+
+* Want More?
+
+  #+begin_notes
+  I would like to give credit to the book: `Hands-On Concurrency With
+  Rust`. In particular, this talk is inspired by chapter 7 of that book
+  and I recommend you get a copy to get a more thorough explanation.
+  #+end_notes
+
+  #+REVEAL_HTML: <img src="images/hands-on-concurrency.jpg" class="stretch" >
+
+  [[https://www.amazon.com/Hands-Concurrency-Rust-Confidently-memory-safe/dp/1788399978][Hands-On Concurrency With Rust Ch. 07]]
+
+* Thanks
+
+  #+REVEAL_HTML: <img src="images/408.jpg" class="stretch" >

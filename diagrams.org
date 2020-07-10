@@ -1,0 +1,81 @@
+#+begin_src plantuml :file diagrams/queue.png
+@startuml
+component [None] as NE
+component [Some(1)] as N1
+component [Some(2)] as N2
+
+NE -right-> N1 : next
+N1 -right-> N2 : next
+
+HEAD -up-> NE : pointer
+TAIL -up-> N2 : pointer
+N2 -right-> NULL : next
+
+note top of NE
+  Empty Node
+end note
+
+@enduml
+#+end_src
+
+#+RESULTS:
+[[file:diagrams/queue.png]]
+
+#+begin_src plantuml :file diagrams/push.png
+@startuml
+component [None] as NE
+component [Some(1)] as N1
+component [Some(2)] as N2
+component [Some(3)] as NW
+
+NE -right-> N1 : next
+N1 -right-> N2 : next
+NW -right-> NULL : next
+
+HEAD -up-> NE : pointer
+
+note top of N2
+  Old Tail
+end note
+
+note top of NW
+  New Tail
+end note
+
+N2 -right-> NW : next
+N2 .right. NULL : old-next
+TAIL -up-> NW : pointer
+@enduml
+#+end_src
+
+#+RESULTS:
+[[file:diagrams/push.png]]
+
+#+begin_src plantuml :file diagrams/pop.png
+@startuml
+component [None] as NE
+component [Some(1) -> None] as N1
+component [Some(2)] as N2
+
+N1 -right-> N2 : next
+
+HEAD -up-> N1 : pointer
+TAIL -up-> N2 : pointer
+N2 -right-> NULL : next
+
+NE .right. N1 : old-next
+
+note top of N1
+  New Head
+end note
+
+
+note top of NE
+  Removed Node
+end note
+
+@enduml
+#+end_src
+
+#+RESULTS:
+[[file:diagrams/pop.png]]
